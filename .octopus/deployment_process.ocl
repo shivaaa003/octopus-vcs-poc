@@ -1,0 +1,110 @@
+step "step-1-install-helm-chart" {
+    name = "step-1 Install Helm Chart"
+    properties = {
+        Octopus.Action.TargetRoles = "helm"
+    }
+
+    action {
+        action_type = "Octopus.Script"
+        properties = {
+            Octopus.Action.RunOnServer = "false"
+            Octopus.Action.Script.ScriptBody = <<-EOT
+                # 1. Add the repo inside the transient agent container
+                echo "Adding Bitnami repository..."
+                helm repo add bitnami https://charts.bitnami.com/bitnami
+                helm repo update
+                
+                # 2. Proceed with the install/upgrade
+                echo "Installing/Upgrading nginx-test..."
+                helm upgrade --install nginx-test bitnami/nginx \
+                  --namespace helm-test \
+                  --create-namespace \
+                  --set service.type=ClusterIP \
+                  --wait
+                EOT
+            Octopus.Action.Script.ScriptSource = "Inline"
+            Octopus.Action.Script.Syntax = "Bash"
+            OctopusUseBundledTooling = "False"
+        }
+        worker_pool_variable = ""
+    }
+}
+
+step "step-2-simulate-failure" {
+    name = "Step 2 – Simulate Failure"
+    properties = {
+        Octopus.Action.TargetRoles = "helm"
+    }
+
+    action {
+        action_type = "Octopus.Script"
+        properties = {
+            Octopus.Action.RunOnServer = "false"
+            Octopus.Action.Script.ScriptBody = <<-EOT
+                helm repo add bitnami https://charts.bitnami.com/bitnami
+                helm repo update
+                
+                # We add 'global.security.allowInsecureImages=true' to bypass the chart's check
+                # and '--atomic' or '--wait' to ensure Helm tracks the failure
+                echo "Simulating a failed deployment..."
+                helm upgrade nginx-test bitnami/nginx \
+                  --namespace helm-test \
+                  --set image.repository=invalidrepo/nonexistent-nginx \
+                  --set image.tag=latest \
+                  --set global.security.allowInsecureImages=true \
+                  --timeout 1m \
+                  --wait
+                EOT
+            Octopus.Action.Script.ScriptSource = "Inline"
+            Octopus.Action.Script.Syntax = "Bash"
+            OctopusUseBundledTooling = "False"
+        }
+        worker_pool_variable = ""
+    }
+}
+
+step "step-3-helm-lock-recovery-script" {
+    condition = "Failure"
+    name = "Step 3 – Helm Lock Recovery Script"
+    properties = {
+        Octopus.Action.TargetRoles = "helm"
+    }
+
+    action {
+        action_type = "Octopus.Script"
+        properties = {
+            Octopus.Action.RunOnServer = "false"
+            Octopus.Action.Script.ScriptBody = <<-EOT
+                #!/bin/bash
+                RELEASE_NAME="nginx-test"
+                NAMESPACE="helm-test"
+                
+                echo "Checking status for $RELEASE_NAME in $NAMESPACE..."
+                STATUS=$(helm status $RELEASE_NAME -n $NAMESPACE -o json | jq -r .info.status)
+                
+                echo "Current Status: $STATUS"
+                
+                if [[ "$STATUS" == "pending-upgrade" || "$STATUS" == "pending-install" || "$STATUS" == "failed" ]]; then
+                    echo "⚠️ Helm lock or failure detected. Initiating recovery..."
+                    
+                    # Get the last successful revision
+                    LAST_SUCCESS=$(helm history $RELEASE_NAME -n $NAMESPACE -o json | jq '[.[] | select(.status == "deployed")] | last | .revision')
+                
+                    if [ "$LAST_SUCCESS" != "null" ]; then
+                        echo "Found last successful revision: $LAST_SUCCESS. Rolling back..."
+                        helm rollback $RELEASE_NAME $LAST_SUCCESS -n $NAMESPACE
+                    else
+                        echo "No successful revision found. Performing cleanup (uninstall)..."
+                        helm uninstall $RELEASE_NAME -n $NAMESPACE
+                    fi
+                else
+                    echo "✅ Release is healthy. No action required."
+                fi
+                EOT
+            Octopus.Action.Script.ScriptSource = "Inline"
+            Octopus.Action.Script.Syntax = "Bash"
+            OctopusUseBundledTooling = "False"
+        }
+        worker_pool_variable = ""
+    }
+}
